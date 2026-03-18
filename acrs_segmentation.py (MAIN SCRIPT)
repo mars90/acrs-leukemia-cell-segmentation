@@ -1,0 +1,104 @@
+import cv2
+import numpy as np
+import os
+
+def acrs_segmentation(image_path, output_dir="output", target_size=150):
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(f"{output_dir}/cells", exist_ok=True)
+
+    img = cv2.imread(image_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32)
+
+    R, G, B = img[:,:,0], img[:,:,1], img[:,:,2]
+
+    B_safe = B.copy()
+    B_safe[B_safe == 0] = 1
+
+    # Ratios
+    G2B = G / B_safe
+    R2B = R / B_safe
+
+    # Adaptive Threshold
+    G2Bmax = np.max(G2B)
+    R2Bmax = np.max(R2B)
+
+    T = G2Bmax / R2Bmax if R2Bmax != 0 else 0
+    print("Threshold T:", T)
+
+    # Segmentation
+    white_mask = (R==255) & (G==255) & (B==255)
+
+    mask = (R <= B) & (G2B <= T) & (~white_mask)
+    binary = (mask.astype(np.uint8)) * 255
+
+    # Median filter
+    filtered = cv2.medianBlur(binary, 5)
+
+    # Morphology
+    kernel = np.ones((3,3), np.uint8)
+    opening = cv2.morphologyEx(filtered, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Distance transform
+    dist = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    _, fg = cv2.threshold(dist, 0.4*dist.max(), 255, 0)
+
+    fg = np.uint8(fg)
+    bg = cv2.dilate(opening, kernel, iterations=3)
+    unknown = cv2.subtract(bg, fg)
+
+    # Markers
+    _, markers = cv2.connectedComponents(fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+
+    img_uint8 = img.astype(np.uint8)
+    markers = cv2.watershed(img_uint8, markers)
+
+    # Save segmented image
+    seg = img_uint8.copy()
+    seg[markers == -1] = [255,0,0]
+    cv2.imwrite(f"{output_dir}/watershed.png", cv2.cvtColor(seg, cv2.COLOR_RGB2BGR))
+
+    # Extract cells
+    cell_id = 0
+
+    for label in np.unique(markers):
+        if label <= 1:
+            continue
+
+        cell_mask = (markers == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(cell_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            x,y,w,h = cv2.boundingRect(cnt)
+            if w < 20 or h < 20:
+                continue
+
+            crop = img_uint8[y:y+h, x:x+w]
+            mask_crop = cell_mask[y:y+h, x:x+w]
+            crop = cv2.bitwise_and(crop, crop, mask=mask_crop)
+
+            canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+
+            if h > target_size or w > target_size:
+                scale = min(target_size/h, target_size/w)
+                crop = cv2.resize(crop, (int(w*scale), int(h*scale)))
+                h, w = crop.shape[:2]
+
+            y_off = (target_size - h)//2
+            x_off = (target_size - w)//2
+
+            canvas[y_off:y_off+h, x_off:x_off+w] = crop
+
+            cv2.imwrite(f"{output_dir}/cells/cell_{cell_id}.png",
+                        cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+
+            cell_id += 1
+
+    print("Cells extracted:", cell_id)
+
+
+if __name__ == "__main__":
+    acrs_segmentation("sample_images/sample.bmp")
